@@ -60,9 +60,15 @@ buildNumber = major*100 + minor*10 + patch      # 1.1.2 -> 112
 | Android armv7 | `ApexDrama-v<ver>-armeabi-v7a.apk` |
 | Windows 安装器 | `ApexDrama-<ver>-windows-x64-setup.exe` |
 | Windows 便携版 | `ApexDrama-<ver>-windows-x64.zip` |
+| iOS（未签名，未测试） | `ApexDrama-<ver>_ios_unsigned.ipa` |
 
 APK 带 `v` 前缀，Windows 包不带。命名必须包含 `arm64-v8a` / `windows-x64`，
 否则 `update_service.dart` 的资产筛选挑不到（会回退到 Release 页面）。
+
+iOS 包以下划线连接版本号，且没有 `v` 前缀：`update_service.dart` 只认
+`.apk` 与含 `windows-x64` 的 zip/msix/exe，`.ipa` 不会被误选。该包**未签名**
+（只能 AltStore / SideStore / Sideloadly 自签安装）且**未经真机验证**，
+发版说明由 `release.yml` 固定追加「iOS（未测试）」一节，不要删掉。
 
 ## 发版流程
 
@@ -96,7 +102,8 @@ gh release create v<ver> -R Sxuan-Coder/open-apex-drama \
   "dist/ApexDrama-v<ver>-arm64-v8a.apk" \
   "dist/ApexDrama-v<ver>-armeabi-v7a.apk" \
   "dist/ApexDrama-<ver>-windows-x64-setup.exe" \
-  "dist/ApexDrama-<ver>-windows-x64.zip"
+  "dist/ApexDrama-<ver>-windows-x64.zip" \
+  "dist/ApexDrama-<ver>_ios_unsigned.ipa"
 
 # 校验
 gh api repos/Sxuan-Coder/open-apex-drama/releases/latest --jq '.tag_name, .name'
