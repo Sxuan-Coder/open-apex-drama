@@ -40,9 +40,11 @@ jobs:
       - run: flutter pub get
 
       # pubspec 的 version 形如 1.5.1+151，取加号前的部分做文件名。
+      # 注意用块标量：sed 表达式里的「: 」在未加引号的 YAML 标量中不合法。
       - name: Read app version
         id: version
-        run: echo "value=$(sed -n 's/^version: *//p' pubspec.yaml | head -1 | cut -d+ -f1)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "value=$(sed -n 's/^version: *//p' pubspec.yaml | head -1 | cut -d+ -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Build iOS (release, no codesign)
         run: flutter build ios --release --no-codesign
