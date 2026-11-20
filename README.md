@@ -5,6 +5,7 @@
 [![Android](https://img.shields.io/badge/Android-下载_APK-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/Sxuan-Coder/open-apex-drama/releases/latest)
 [![Windows](https://img.shields.io/badge/Windows-下载-0078D4?style=for-the-badge&logo=windows11&logoColor=white)](https://github.com/Sxuan-Coder/open-apex-drama/releases/latest)
 [![License](https://img.shields.io/badge/License-AGPL_v3-blue?style=for-the-badge)](https://www.gnu.org/licenses/agpl-3.0)
+[![官网](https://img.shields.io/badge/官网-apexdrama.sxapex.com-FF6B9D?style=for-the-badge&logo=googlechrome&logoColor=white)](https://apexdrama.sxapex.com)
 
 *前两个徽标跳转最新版本下载*
 
