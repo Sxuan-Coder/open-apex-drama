@@ -109,6 +109,16 @@ gh release create v<ver> -R Sxuan-Coder/open-apex-drama \
 gh api repos/Sxuan-Coder/open-apex-drama/releases/latest --jq '.tag_name, .name'
 ```
 
+## 分支与 PR 门禁
+
+- **改动超过 400 行必须走 PR**：单次改动（`git diff --stat` 的新增 + 删除行数合计）超过
+  400 行时，禁止直接推 `master`，必须新建分支 → 提 PR → CI 全绿 → squash 合并。
+- **大功能必须单一分支开发**：跨模块、涉及多个文件或需要多次提交的功能改动，新建
+  `feat/` / `fix/` / `refactor/` 开头的独立分支完成，全部改动收在该分支上，合并后先把
+  本地 `master` 对齐 `origin/master` 再开下一个分支；不允许长期并行的多条功能分支
+  同时改同一批文件。
+- PR 标题沿用 `<type>(scope): <summary>`，描述写清改动内容、验证方式与风险点。
+
 ## 其他约束
 
 - **签名（重要）**：正式包使用固定 release keystore，**绝不能再用 debug 签名**——
