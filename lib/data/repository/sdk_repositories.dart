@@ -400,8 +400,13 @@ class SdkPlaybackRepository implements PlaybackRepository {
         if (bundle.streams.isNotEmpty) {
           _cache[episodeId] = bundle;
         }
+        // 记录各清晰度编码：bytevc2 等无法解码的编码会在播放器层
+        // 黑屏，取址日志看不出问题，必须在这里留痕（issue #8）。
+        final String codecs = bundle.streams
+            .map((StreamInfo s) => '${s.definition}:${s.codec}')
+            .join(',');
         _logResolve(
-          'ok episode=$episodeId streams=${bundle.streams.length}'
+          'ok episode=$episodeId streams=${bundle.streams.length} codecs=$codecs'
           '${attempt > 0 ? ' retry=$attempt' : ''}',
         );
         return bundle;
@@ -416,6 +421,11 @@ class SdkPlaybackRepository implements PlaybackRepository {
         await Future<void>.delayed(_resolveBackoff[attempt]);
       }
     }
+  }
+
+  @override
+  void invalidate(String episodeId) {
+    _cache.remove(episodeId);
   }
 
   @override

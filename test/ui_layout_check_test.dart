@@ -1136,6 +1136,9 @@ class _ThirtyEpisodePlaybackRepository implements PlaybackRepository {
   }
 
   @override
+  void invalidate(String episodeId) {}
+
+  @override
   Future<List<DanmakuCue>> danmaku(String seriesId, String episodeId) async {
     return const <DanmakuCue>[];
   }
