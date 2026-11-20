@@ -23,7 +23,10 @@ import '../models/series_detail.dart';
 import '../player/video_output.dart';
 import '../providers/data_providers.dart';
 import '../providers/watch_providers.dart';
+import '../services/dlna/cast_controller.dart';
+import '../services/dlna/dlna_device.dart';
 import '../theme/app_colors.dart';
+import '../widgets/cast_sheet.dart';
 import '../widgets/danmaku_layer.dart';
 import '../widgets/danmaku_settings.dart';
 import '../widgets/player_actions_sheet.dart';
@@ -136,6 +139,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// 当前渲染输出模式。Android 默认 mediacodec_embed；解码器起不来时
   /// 退回 texture（软解码 + 纹理渲染），见 [_rebuildWithSoftwareDecode]。
   VideoOutputMode _outputMode = defaultVideoOutputMode();
+
+  /// DLNA 投屏会话；null 表示未投屏。投屏期间本地播放器暂停，进度以
+  /// 电视侧轮询结果为准。
+  CastController? _cast;
+  bool _castLocalWasPlaying = false;
+
+  /// 投屏仅面向移动端（Android / iOS）；桌面端不展示入口。
+  bool get _supportsCast =>
+      defaultTargetPlatform == TargetPlatform.android ||
+      defaultTargetPlatform == TargetPlatform.iOS;
 
   /// 解码兜底进行中（防重入：兜底只对本页做一次）。
   bool _decodeFallbackInFlight = false;
@@ -467,6 +480,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     try {
       _persistProgress(force: true);
     } catch (_) {}
+    // 退出播放页即结束投屏（dispose 内部异步发停止命令）。
+    _cast?.dispose();
+    _cast = null;
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     _controlsHideTimer?.cancel();
     _swipeController.dispose();
@@ -557,8 +573,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (!force && now - _lastProgressWriteAt < _progressWriteIntervalMs) {
       return;
     }
-    final int positionSeconds = player.state.position.inSeconds;
-    final int durationSeconds = player.state.duration.inSeconds;
+    // 投屏时本地播放器暂停，进度必须以电视侧的轮询位置为准，否则会
+    // 用冻结的本地进度覆盖历史记录。
+    final CastController? cast = _cast;
+    final bool casting = cast != null && cast.isCasting;
+    final int positionSeconds = casting
+        ? cast.position.inSeconds
+        : player.state.position.inSeconds;
+    final int durationSeconds = casting && cast.duration > Duration.zero
+        ? cast.duration.inSeconds
+        : player.state.duration.inSeconds;
     if (positionSeconds <= 0 && durationSeconds <= 0) {
       return;
     }
@@ -591,6 +615,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final Player? player = _player;
     if (player == null) {
       return;
+    }
+    // 切集 / 重试会重建本地播放链路：先结束投屏，避免电视继续放着上一集。
+    if (_cast != null) {
+      unawaited(_stopCast(resumeLocal: false));
     }
     final int token = ++_bootToken;
     _cachedOpenErrorSub?.cancel();
@@ -1000,6 +1028,140 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       onQuality: _showQualitySheet,
       onDanmakuSettings: () => showDanmakuSettings(context),
     );
+  }
+
+  /// 投屏入口：已在投屏时打开控制面板，否则先搜索同一 Wi-Fi 下的电视。
+  Future<void> _openCast() async {
+    final CastController? active = _cast;
+    if (active != null && active.isCasting) {
+      await showCastStatusSheet(context, active, onStop: _stopCast);
+      return;
+    }
+    if (active != null) {
+      // 上一次投屏报错后残留的会话：清理后再重新选择设备。
+      active.dispose();
+      _cast = null;
+    }
+    final DlnaDevice? device = await showCastDevicePicker(context);
+    if (device == null || !mounted) {
+      return;
+    }
+    await _startCast(device);
+  }
+
+  /// 挑选可投屏的流：电视自己拉流，受加密保护的流无法在电视侧解密；
+  /// 优先非 HLS（多数电视不支持 HLS），其次分辨率最高。
+  StreamInfo? _pickCastStream() {
+    final PlaybackBundle? bundle = _bundle;
+    if (bundle == null) {
+      final StreamInfo? current = _currentStream;
+      return current != null && !current.protected && current.url.isNotEmpty
+          ? current
+          : null;
+    }
+    final List<StreamInfo> candidates = bundle.streams
+        .where((StreamInfo s) => !s.protected && s.url.isNotEmpty)
+        .toList();
+    if (candidates.isEmpty) {
+      return null;
+    }
+    final StreamInfo? current = _currentStream;
+    if (current != null &&
+        !current.hls &&
+        candidates.any((StreamInfo s) => s.url == current.url)) {
+      return current;
+    }
+    candidates.sort((StreamInfo a, StreamInfo b) {
+      if (a.hls != b.hls) {
+        return a.hls ? 1 : -1;
+      }
+      return b.height.compareTo(a.height);
+    });
+    return candidates.first;
+  }
+
+  Future<void> _startCast(DlnaDevice device) async {
+    final StreamInfo? stream = _pickCastStream();
+    final Uri? upstream = stream == null ? null : Uri.tryParse(stream.url);
+    if (stream == null || upstream == null) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(content: Text('当前剧集为加密流，暂不支持投屏')),
+        );
+      return;
+    }
+    final Player? player = _player;
+    final Duration startAt = player?.state.position ?? Duration.zero;
+    _castLocalWasPlaying = player?.state.playing ?? false;
+    final CastController controller = CastController();
+    setState(() => _cast = controller);
+    await controller.start(
+      device: device,
+      upstream: upstream,
+      title: '${_activeDrama.title} 第$_episode集',
+      userAgent: kCdnUserAgent,
+      startAt: startAt,
+      duration: player?.state.duration ?? Duration.zero,
+      mime: stream.hls ? 'application/vnd.apple.mpegurl' : 'video/mp4',
+      extension: stream.hls ? 'm3u8' : 'mp4',
+    );
+    if (!mounted) {
+      if (!controller.disposed) {
+        controller.dispose();
+      }
+      return;
+    }
+    if (controller.phase == CastPhase.error) {
+      final String message = controller.errorMessage;
+      controller.dispose();
+      setState(() => _cast = null);
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(message)));
+      return;
+    }
+    // 避免手机与电视同时出声：投屏成功后本地暂停。
+    try {
+      await player?.pause();
+    } catch (_) {}
+    if (!mounted) {
+      return;
+    }
+    await showCastStatusSheet(context, controller, onStop: _stopCast);
+  }
+
+  /// 停止投屏并（默认）把电视侧进度接回本地播放。
+  Future<void> _stopCast({bool resumeLocal = true}) async {
+    final CastController? controller = _cast;
+    if (controller == null) {
+      return;
+    }
+    // 先摘掉引用，防止页面销毁与手动停止并发时重复 dispose。
+    _cast = null;
+    if (mounted) {
+      setState(() {});
+    }
+    final Duration? position = await controller.stop();
+    if (!controller.disposed) {
+      controller.dispose();
+    }
+    if (!resumeLocal || !mounted) {
+      return;
+    }
+    final Player? player = _player;
+    if (player == null || position == null) {
+      return;
+    }
+    try {
+      await player.seek(position);
+      if (_castLocalWasPlaying) {
+        await player.play();
+      }
+    } catch (_) {
+      // 接回失败不阻塞退出投屏；进度仍会在下次播放时按历史记录恢复。
+    }
+    _persistProgress(force: true);
   }
 
   Future<void> _showEpisodes() async {
@@ -1855,6 +2017,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                                       onSpeed: _showSpeedSheet,
                                       isFullscreen: isWide,
                                       onToggleFullscreen: _toggleFullscreen,
+                                      onCast: _supportsCast ? _openCast : null,
+                                      casting: _cast?.isCasting ?? false,
                                     ),
                                   ),
                                   Align(
@@ -2169,6 +2333,8 @@ class _PlayerTopBar extends StatelessWidget {
     this.onSpeed,
     this.isFullscreen = false,
     this.onToggleFullscreen,
+    this.onCast,
+    this.casting = false,
   });
 
   final Drama drama;
@@ -2183,6 +2349,10 @@ class _PlayerTopBar extends StatelessWidget {
   final VoidCallback? onSpeed;
   final bool isFullscreen;
   final VoidCallback? onToggleFullscreen;
+
+  /// 投屏入口；null 表示当前平台不展示（桌面端）。
+  final VoidCallback? onCast;
+  final bool casting;
 
   @override
   Widget build(BuildContext context) {
@@ -2234,6 +2404,16 @@ class _PlayerTopBar extends StatelessWidget {
               ],
             ),
           ),
+          if (onCast != null) ...<Widget>[
+            _GlassSquareButton(
+              icon: casting
+                  ? Icons.cast_connected_rounded
+                  : Icons.cast_rounded,
+              tooltip: casting ? '正在投屏' : '投屏',
+              onPressed: onCast!,
+            ),
+            const SizedBox(width: 2),
+          ],
           if (showMobileActions) ...<Widget>[
             _RailTextAction(label: speedLabel, onTap: onSpeed ?? () {}),
             const SizedBox(width: 4),

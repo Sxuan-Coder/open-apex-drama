@@ -8,6 +8,9 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<!-- 投屏：SSDP 搜索电视会触发 iOS 的本地网络权限提示 -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用于搜索同一 Wi-Fi 下的电视并进行投屏</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
