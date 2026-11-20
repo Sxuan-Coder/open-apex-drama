@@ -133,6 +133,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// 清晰度切换进行中（防重入）。
   bool _switchingQuality = false;
 
+  /// 当前渲染输出模式。Android 默认 mediacodec_embed；解码器起不来时
+  /// 退回 texture（软解码 + 纹理渲染），见 [_rebuildWithSoftwareDecode]。
+  VideoOutputMode _outputMode = defaultVideoOutputMode();
+
+  /// 解码兜底进行中（防重入：兜底只对本页做一次）。
+  bool _decodeFallbackInFlight = false;
+
   late int _episode;
   int _episodeCount = 0;
   List<EpisodeInfo> _episodes = const <EpisodeInfo>[];
@@ -357,7 +364,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _player = player;
     _controller = VideoController(
       player,
-      configuration: videoOutputConfiguration(defaultVideoOutputMode()),
+      configuration: videoOutputConfiguration(_outputMode),
     );
     _completedSub = player.stream.completed.listen((bool done) {
       // 开流中 / 切档中不重复响应，避免 completed 连发时连跳两集。
@@ -371,8 +378,72 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     player.stream.log.listen((PlayerLog event) {
       if (event.level.contains('error')) {
         debugPrint('[player-audio][${event.level}] ${event.text}');
+        _maybeFallbackDecode(event.text);
       }
     });
+  }
+
+  /// mediacodec_embed 硬解起不来时退回软解码。
+  ///
+  /// 现象：模拟器（及缺少 HEVC 硬解的低端真机）上 MediaCodec 初始化失败，
+  /// mpv 报 `hevc_mediacodec: MediaCodec 0x0 failed to start`，表现为音频
+  /// 与字幕正常、画面全黑。此时换到 texture 模式（media_kit 软渲染管线）
+  /// 重新开流即可出画。
+  void _maybeFallbackDecode(String text) {
+    if (_outputMode != VideoOutputMode.embed) {
+      return; // 已经是软解码管线，不再重复兜底
+    }
+    if (_decodeFallbackInFlight || !mounted) {
+      return;
+    }
+    if (!text.contains('mediacodec') || !text.contains('failed to start')) {
+      return;
+    }
+    _decodeFallbackInFlight = true;
+    unawaited(_rebuildWithSoftwareDecode());
+  }
+
+  /// 用 texture 模式重建播放器，并接着当前进度重开同一流。
+  Future<void> _rebuildWithSoftwareDecode() async {
+    final Player? player = _player;
+    final StreamInfo? stream = _currentStream;
+    if (player == null || stream == null) {
+      _decodeFallbackInFlight = false;
+      return;
+    }
+    final Duration resume = player.state.position;
+    final bool wasPlaying = player.state.playing;
+    debugPrint('[player] mediacodec 启动失败，退回软解码渲染');
+    try {
+      await _completedSub?.cancel();
+      _completedSub = null;
+      try {
+        await player.dispose();
+      } catch (_) {
+        // 旧 Player 销毁失败不阻塞重建。
+      }
+      _player = null;
+      _controller = null;
+      _outputMode = VideoOutputMode.texture;
+      if (mounted) {
+        setState(() {});
+      }
+      _buildPlayer();
+      _decodeFallbackInFlight = false;
+      await _boot(
+        stream: stream,
+        resumeFrom: resume,
+        playWhenReady: wasPlaying,
+      );
+    } catch (_) {
+      _decodeFallbackInFlight = false;
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = '播放器初始化失败';
+        });
+      }
+    }
   }
 
   @override
