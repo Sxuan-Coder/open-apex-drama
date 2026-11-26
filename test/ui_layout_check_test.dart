@@ -852,6 +852,104 @@ void main() {
     ]);
   }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 
+  testWidgets('mini player entry is Windows only', (
+    WidgetTester tester,
+  ) async {
+    final backend = _MiniPlayerBackend();
+    await pumpScreen(
+      tester,
+      PlayerScreen(
+        drama: mockHero,
+        createPlayer: () => media.Player(platformPlayer: backend),
+        createVideoController: (_, {required configuration}) => null,
+      ),
+      size: const Size(390, 844),
+    );
+    // 尺寸已知也不该出现入口：通道只在 Windows 注册。
+    backend.setVideoSize(1280, 720);
+    await tester.pumpAndSettle();
+    // 等下一集预解析的延时任务落地，否则测试结束时会报 pending timer。
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('打开小窗'), findsNothing);
+    expect(tester.takeException(), isNull);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+  testWidgets('mini player entry failure keeps the entry available', (
+    WidgetTester tester,
+  ) async {
+    const MethodChannel channel = MethodChannel('apexduanju/mini_player');
+    final backend = _MiniPlayerBackend();
+    int enterCalls = 0;
+    final TestDefaultBinaryMessenger messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (MethodCall call) async {
+      if (call.method == 'enter') {
+        enterCalls++;
+        throw PlatformException(code: 'window', message: 'enter failed');
+      }
+      return null;
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+    await pumpScreen(
+      tester,
+      PlayerScreen(
+        drama: mockHero,
+        createPlayer: () => media.Player(platformPlayer: backend),
+        createVideoController: (_, {required configuration}) => null,
+      ),
+      size: const Size(800, 600),
+    );
+    backend.setVideoSize(1280, 720);
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('打开小窗'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('打开小窗'));
+    await tester.pumpAndSettle();
+    // 原生拒绝后回滚：仍是主窗口形态，入口还能再点一次。
+    expect(find.byTooltip('打开小窗'), findsOneWidget);
+    expect(find.byTooltip('返回播放窗口'), findsNothing);
+
+    await tester.tap(find.byTooltip('打开小窗'));
+    await tester.pumpAndSettle();
+    expect(enterCalls, 2);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+
+  testWidgets('mini player progress slider seeks', (
+    WidgetTester tester,
+  ) async {
+    const MethodChannel channel = MethodChannel('apexduanju/mini_player');
+    final backend = _MiniPlayerBackend();
+    final TestDefaultBinaryMessenger messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (MethodCall call) async => null);
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+    await pumpScreen(
+      tester,
+      PlayerScreen(
+        drama: mockHero,
+        createPlayer: () => media.Player(platformPlayer: backend),
+        createVideoController: (_, {required configuration}) => null,
+      ),
+      size: const Size(800, 600),
+    );
+    backend.setVideoSize(1280, 720);
+    backend.setDuration(const Duration(seconds: 100));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('打开小窗'));
+    await tester.pump();
+    tester.view.physicalSize = const Size(384, 216);
+    await tester.pump();
+    expect(find.byType(Slider), findsOneWidget);
+
+    await tester.drag(find.byType(Slider), const Offset(40, 0));
+    await tester.pumpAndSettle();
+    expect(backend.lastSeek, isNotNull);
+    expect(backend.lastSeek!.inSeconds, greaterThan(30));
+    expect(backend.lastSeek!.inSeconds, lessThanOrEqualTo(100));
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+
   testWidgets('category filter chip tap refreshes the result grid', (
     WidgetTester tester,
   ) async {
@@ -1482,6 +1580,17 @@ class _MiniPlayerBackend extends media.PlatformPlayer {
 
   int opens = 0;
   bool failOpen = false;
+  Duration? lastSeek;
+
+  void setDuration(Duration duration) {
+    state = state.copyWith(duration: duration);
+    durationController.add(duration);
+  }
+
+  @override
+  Future<void> seek(Duration duration) async {
+    lastSeek = duration;
+  }
 
   void setVideoSize(int width, int height, {int rotate = 0}) {
     videoParamsController.add(
