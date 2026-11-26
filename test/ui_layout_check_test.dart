@@ -14,6 +14,7 @@ import 'package:apexduanju/models/danmaku_cue.dart';
 import 'package:apexduanju/models/drama.dart';
 import 'package:apexduanju/models/playback.dart';
 import 'package:apexduanju/models/series_detail.dart';
+import 'package:apexduanju/player/player_environment.dart';
 import 'package:apexduanju/providers/data_providers.dart';
 import 'package:apexduanju/screens/category_screen.dart';
 import 'package:apexduanju/screens/downloads_screen.dart';
@@ -773,8 +774,7 @@ void main() {
       tester,
       PlayerScreen(
         drama: mockHero,
-        createPlayer: () => media.Player(platformPlayer: backend),
-        createVideoController: (_, {required configuration}) => null,
+        environment: PlayerEnvironment(platformPlayerFactory: () => backend),
       ),
       size: const Size(800, 600),
     );
@@ -860,8 +860,7 @@ void main() {
       tester,
       PlayerScreen(
         drama: mockHero,
-        createPlayer: () => media.Player(platformPlayer: backend),
-        createVideoController: (_, {required configuration}) => null,
+        environment: PlayerEnvironment(platformPlayerFactory: () => backend),
       ),
       size: const Size(390, 844),
     );
@@ -895,8 +894,7 @@ void main() {
       tester,
       PlayerScreen(
         drama: mockHero,
-        createPlayer: () => media.Player(platformPlayer: backend),
-        createVideoController: (_, {required configuration}) => null,
+        environment: PlayerEnvironment(platformPlayerFactory: () => backend),
       ),
       size: const Size(800, 600),
     );
@@ -928,8 +926,7 @@ void main() {
       tester,
       PlayerScreen(
         drama: mockHero,
-        createPlayer: () => media.Player(platformPlayer: backend),
-        createVideoController: (_, {required configuration}) => null,
+        environment: PlayerEnvironment(platformPlayerFactory: () => backend),
       ),
       size: const Size(800, 600),
     );

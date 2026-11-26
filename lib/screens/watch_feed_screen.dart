@@ -9,6 +9,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../data/mock_data.dart';
 import '../models/drama.dart';
 import '../models/playback.dart';
+import '../player/player_environment.dart';
 import '../player/video_output.dart';
 import '../providers/data_providers.dart';
 import '../theme/app_colors.dart';
@@ -20,11 +21,18 @@ import 'player_screen.dart';
 /// 封面只作为加载/解析失败时的兜底；正常情况直接播放第一集。
 /// 「看全集」直接进入播放页，不经过作品详情页。
 class WatchFeedScreen extends ConsumerStatefulWidget {
-  const WatchFeedScreen({super.key, this.active = true});
+  const WatchFeedScreen({
+    super.key,
+    this.active = true,
+    this.environment = PlayerEnvironment.live,
+  });
 
   /// 当前 Tab 是否在前台。IndexedStack 会同时构建所有 Tab，
   /// 只有 active 时才解析/播放，避免启动即消耗解析额度。
   final bool active;
+
+  /// 播放器依赖：时钟与播放器工厂（与播放页共用），widget 测试注入假实现。
+  final PlayerEnvironment environment;
 
   @override
   ConsumerState<WatchFeedScreen> createState() => _WatchFeedScreenState();
@@ -42,7 +50,9 @@ class _FeedMedia {
 
   final String dramaId;
   final Player player;
-  final VideoController controller;
+
+  /// 没有原生视频输出时为 null（见 [PlayerEnvironment.createPlayer]）。
+  final VideoController? controller;
   final PlaybackBundle bundle;
   final StreamInfo stream;
   final int episodeCount;
@@ -313,15 +323,14 @@ class _WatchFeedScreenState extends ConsumerState<WatchFeedScreen> {
       if (stream == null || stream.url.isEmpty) {
         return null;
       }
-      player = Player();
-      final VideoController controller = VideoController(
-        player,
-        configuration: videoOutputConfiguration(defaultVideoOutputMode()),
+      final PlayerBundle created = widget.environment.createPlayer(
+        videoOutputConfiguration(defaultVideoOutputMode()),
       );
+      player = created.player;
       return _FeedMedia(
         dramaId: drama.id,
-        player: player,
-        controller: controller,
+        player: created.player,
+        controller: created.controller,
         bundle: bundle,
         stream: stream,
         episodeCount: episodes.length,
@@ -355,7 +364,7 @@ class _WatchFeedScreenState extends ConsumerState<WatchFeedScreen> {
       await media.player.setVolume(0);
       await media.player.open(Media(media.stream.url), play: false);
       bool rendered = true;
-      await media.controller.waitUntilFirstFrameRendered.timeout(
+      await media.controller?.waitUntilFirstFrameRendered.timeout(
         const Duration(seconds: 6),
         onTimeout: () {
           rendered = false;
@@ -438,8 +447,14 @@ class _WatchFeedScreenState extends ConsumerState<WatchFeedScreen> {
         ? _withEpisodeCount(drama, count)
         : drama;
     unawaited(_current?.player.pause());
-    await openPlayer(context, target, assumePlayable: true);
-    if (mounted && widget.active) {
+    final bool closedBySleepTimer = await openPlayer(
+      context,
+      target,
+      assumePlayable: true,
+      environment: widget.environment,
+    );
+    // 定时关闭退出的不恢复信息流：否则「已停止播放」的提示下面还在出声。
+    if (!closedBySleepTimer && mounted && widget.active) {
       unawaited(_current?.player.play());
     }
   }

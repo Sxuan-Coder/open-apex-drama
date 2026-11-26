@@ -20,6 +20,8 @@ import '../models/danmaku_cue.dart';
 import '../models/drama.dart';
 import '../models/playback.dart';
 import '../models/series_detail.dart';
+import '../player/player_environment.dart';
+import '../player/sleep_timer.dart';
 import '../player/video_output.dart';
 import '../providers/data_providers.dart';
 import '../providers/watch_providers.dart';
@@ -27,13 +29,21 @@ import '../theme/app_colors.dart';
 import '../widgets/danmaku_layer.dart';
 import '../widgets/danmaku_settings.dart';
 import '../widgets/player_actions_sheet.dart';
+import '../widgets/player_sheet_header.dart';
+import '../widgets/player_sleep_timer.dart';
 import '../widgets/poster_artwork.dart';
 
-Future<void> openPlayer(
+/// 打开播放页。
+///
+/// 返回 true 表示播放页是被「定时关闭」退出的：调用方不应接着恢复自己的播放
+///（例如「看剧」信息流内嵌的播放器）。用户手动返回、或该剧未开播而没打开时
+/// 返回 false。
+Future<bool> openPlayer(
   BuildContext context,
   Drama drama, {
   int episodeNumber = 1,
   bool assumePlayable = false,
+  PlayerEnvironment environment = PlayerEnvironment.live,
 }) async {
   // 预约中 / 未开播的剧集没有分集，分集接口会返回空结果，SDK 会把它当成
   // 「匿名设备受限」报错（实测多季剧的新一季显示"全0集"）。在这里直接拦住。
@@ -42,10 +52,10 @@ Future<void> openPlayer(
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(const SnackBar(content: Text('该剧暂未开播，敬请期待')));
-    return;
+    return false;
   }
-  await Navigator.of(context).push(
-    PageRouteBuilder<void>(
+  final bool? closedBySleepTimer = await Navigator.of(context).push<bool>(
+    PageRouteBuilder<bool>(
       transitionDuration: const Duration(milliseconds: 220),
       reverseTransitionDuration: const Duration(milliseconds: 180),
       pageBuilder:
@@ -54,7 +64,11 @@ Future<void> openPlayer(
             Animation<double> animation,
             Animation<double> secondaryAnimation,
           ) {
-            return PlayerScreen(drama: drama, episodeNumber: episodeNumber);
+            return PlayerScreen(
+              drama: drama,
+              episodeNumber: episodeNumber,
+              environment: environment,
+            );
           },
       transitionsBuilder:
           (
@@ -67,6 +81,7 @@ Future<void> openPlayer(
           },
     ),
   );
+  return closedBySleepTimer ?? false;
 }
 
 /// 沉浸式播放页：解析真实播放地址（含加密密钥）后用 media_kit 播放。
@@ -88,17 +103,15 @@ class PlayerScreen extends ConsumerStatefulWidget {
     super.key,
     required this.drama,
     this.episodeNumber = 1,
-    this.createPlayer = Player.new,
-    this.createVideoController = VideoController.new,
+    this.environment = PlayerEnvironment.live,
   });
 
   final Drama drama;
   final int episodeNumber;
-  final Player Function() createPlayer;
-  final VideoController? Function(
-    Player player, {
-    required VideoControllerConfiguration configuration,
-  }) createVideoController;
+
+  /// 播放器依赖：时钟与播放器工厂。widget 测试没有 media_kit 的原生库，
+  /// 用它注入假播放器和假时钟。
+  final PlayerEnvironment environment;
 
   @override
   ConsumerState<PlayerScreen> createState() => _PlayerScreenState();
@@ -281,6 +294,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   Timer? _controlsHideTimer;
   bool _playing = false;
 
+  /// 定时关闭：倒计时到点或本集播完时停止播放并退出，见 [_closeForSleepTimer]。
+  late final SleepTimer _sleepTimer = SleepTimer(
+    now: widget.environment.now,
+    onElapsed: _closeForSleepTimer,
+  );
+
+  /// 定时关闭的退页只执行一次（completed 流事件与到点回调可能先后到达）。
+  bool _sleepTimerClosing = false;
+
   /// 当前是否横屏全屏布局（全屏请求或物理旋转任一成立）。
   bool get _isWideLayout =>
       _isFullscreen ||
@@ -395,16 +417,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// Player 上直接 open 新流，Surface 复用可能导致 MediaCodec 初始化
   /// 失败黑屏，因此切档走 dispose → 重建 → 重新 open 的完整链路。
   void _buildPlayer() {
-    final Player player = widget.createPlayer();
-    _player = player;
-    _controller = widget.createVideoController(
-      player,
-      configuration: videoOutputConfiguration(_outputMode),
+    final PlayerBundle bundle = widget.environment.createPlayer(
+      videoOutputConfiguration(_outputMode),
     );
+    final Player player = bundle.player;
+    _player = player;
+    _controller = bundle.controller;
     _completedSub = player.stream.completed.listen((bool done) {
       // 开流中 / 切档中不重复响应，避免 completed 连发时连跳两集。
-      if (done && _autoPlay && mounted && !_loading && !_switchingQuality) {
-        _onEpisodeCompleted();
+      if (done && mounted && !_loading && !_switchingQuality) {
+        _onStreamCompleted();
       }
     });
     _observeProgress(player);
@@ -509,6 +531,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     } catch (_) {}
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     _controlsHideTimer?.cancel();
+    _sleepTimer.dispose();
     _swipeController.dispose();
     _clearPrefetch();
     _completedSub?.cancel();
@@ -992,6 +1015,120 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       return;
     }
     await _boot(stream: target, resumeFrom: resumeFrom);
+  }
+
+  /// 流自然播完：定时选了「播完本集」就退出，否则按自动播放决定是否切下一集。
+  void _onStreamCompleted() {
+    switch (episodeEndAction(
+      autoPlay: _autoPlay,
+      sleepTimerStopsAtEpisodeEnd: _sleepTimer.stopsAtEpisodeEnd,
+    )) {
+      case EpisodeEndAction.closeForSleepTimer:
+        _closeForSleepTimer();
+      case EpisodeEndAction.advance:
+        _onEpisodeCompleted();
+      case EpisodeEndAction.none:
+        break;
+    }
+  }
+
+  Future<void> _showSleepTimerSheet() async {
+    final SleepTimerOption? picked = await _showPlayerSheet<SleepTimerOption>(
+      builder: (BuildContext context) =>
+          SleepTimerSheet(current: _sleepTimer.state.value),
+    );
+    if (picked == null || !mounted) {
+      return;
+    }
+    _applySleepTimer(picked);
+  }
+
+  /// 应用定时选项并提示。重新选择即覆盖：倒计时与「播完本集」互斥。
+  void _applySleepTimer(SleepTimerOption option) {
+    if (option == SleepTimerOption.off) {
+      _sleepTimer.cancel();
+    } else if (option == SleepTimerOption.episodeEnd) {
+      _sleepTimer.armUntilEpisodeEnd();
+    } else {
+      _sleepTimer.startCountdown(option.duration);
+    }
+    debugPrint('[player] 定时关闭：${option.label}');
+    _showPlayerSnackBar(sleepTimerFeedback(option));
+  }
+
+  /// 播放页的短提示：底部悬浮条，会盖住底部控制行几秒（与页面内其它提示一致）。
+  void _showPlayerSnackBar(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+  }
+
+  /// 定时关闭到点：停播并退出播放页。
+  ///
+  /// 必须显式停掉播放器再退页：应用退到后台 / 息屏时 Flutter 不调度帧，
+  /// 路由退场动画不会推进，[dispose] 要等下次回到前台才执行——只 pop 的话
+  /// 声音会一直放到用户点亮屏幕。
+  void _closeForSleepTimer() {
+    if (_sleepTimerClosing || !mounted) {
+      return;
+    }
+    _sleepTimerClosing = true;
+    debugPrint('[player] 定时关闭到点：停止播放并退出');
+    // 先解除定时：到点后不再处于任何模式，入口随之恢复成未开启的样子。
+    _sleepTimer.cancel();
+    // 作废还在路上的启动（例如刚触发的自动连播）：退场的 180ms 里本页仍
+    // mounted，不作废的话它会把下一集开流。
+    _bootToken++;
+    _persistProgress(force: true);
+    unawaited(_stopPlayback());
+    // 用户刚好自己按了返回（路由已在退场）时不再提示，也不再多 pop 一次。
+    if (_popPlayerRoute()) {
+      _showPlayerSnackBar('定时关闭，已停止播放');
+    }
+  }
+
+  /// 停播并吞掉异常：[Player.stop] 是异步的，退页过程中播放器可能正被切档
+  /// 重建销毁；失败也不阻塞退页，dispose 还会再停一次。
+  Future<void> _stopPlayback() async {
+    try {
+      await _player?.stop();
+    } catch (_) {}
+  }
+
+  /// 退出播放页，返回退页是否由本次调用发起。
+  ///
+  /// 上面还盖着弹层（选集 / 定时面板 / 弹幕设置）时一并关掉——否则 pop 只会
+  /// 关掉最上层的弹层，播放器继续播。以 `true` 作为路由结果，让 [openPlayer]
+  /// 的调用方知道这次退出来自定时关闭。
+  bool _popPlayerRoute() {
+    final ModalRoute<Object?>? route = _route;
+    final NavigatorState? navigator = route?.navigator;
+    // 路由已在退场（用户刚按了返回，180ms 动画里本页仍 mounted）或已被移除时
+    // isActive 为 false，它也就不是「当前路由」：再往下走 popUntil 的谓词永远
+    // 不成立，会一路 pop 到根路由，把整个导航栈清空。
+    if (route == null ||
+        !route.isActive ||
+        navigator == null ||
+        !navigator.mounted) {
+      return false;
+    }
+    if (!route.isCurrent) {
+      navigator.popUntil((Route<dynamic> above) => above == route);
+    }
+    if (!route.isCurrent) {
+      return false;
+    }
+    navigator.pop(true);
+    return true;
   }
 
   /// 本集自然播完：移动端竖屏先走与手动上滑一致的上滑动画，再切集；
@@ -2227,6 +2364,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                                       episodeNumber: _episode,
                                       qualityLabel:
                                           _currentStream?.definition ?? '',
+                                      sleepTimer: _sleepTimer.state,
+                                      onSleepTimer: _showSleepTimerSheet,
                                       showMobileActions: compactControls,
                                       speedLabel: _speedLabel,
                                       onSpeed: _showSpeedSheet,
@@ -2544,6 +2683,8 @@ class _PlayerTopBar extends StatelessWidget {
     required this.drama,
     required this.episodeNumber,
     required this.qualityLabel,
+    required this.sleepTimer,
+    required this.onSleepTimer,
     this.showMobileActions = false,
     this.speedLabel = '',
     this.onSpeed,
@@ -2556,6 +2697,10 @@ class _PlayerTopBar extends StatelessWidget {
 
   /// 当前流清晰度（如 1080P）；空串表示未就绪，副标题只显示集数。
   final String qualityLabel;
+
+  /// 定时关闭的状态与入口：各布局都放在顶栏右侧，随状态切换倒计时。
+  final ValueListenable<SleepTimerState?> sleepTimer;
+  final VoidCallback onSleepTimer;
 
   /// 移动端竖屏：标题右侧放倍速 pill 与全屏按钮（全屏从底部控制行上移）。
   final bool showMobileActions;
@@ -2614,6 +2759,8 @@ class _PlayerTopBar extends StatelessWidget {
               ],
             ),
           ),
+          // 定时关闭：竖屏与宽屏布局都放在顶栏右侧，标题是 Expanded 不会挤溢出。
+          SleepTimerEntry(timer: sleepTimer, onTap: onSleepTimer),
           if (showMobileActions) ...<Widget>[
             _RailTextAction(label: speedLabel, onTap: onSpeed ?? () {}),
             const SizedBox(width: 4),
@@ -3469,7 +3616,7 @@ class _EpisodeSheetState extends State<_EpisodeSheet> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            _SheetHeader(title: '选集', subtitle: subtitle),
+            PlayerSheetHeader(title: '选集', subtitle: subtitle),
             if (widget.seasons.length > 1)
               SizedBox(
                 height: 40,
@@ -3608,51 +3755,6 @@ class _EpisodeSheetState extends State<_EpisodeSheet> {
   }
 }
 
-class _SheetHeader extends StatelessWidget {
-  const _SheetHeader({required this.title, required this.subtitle});
-
-  final String title;
-  final String subtitle;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 14, 10, 8),
-      child: Row(
-        children: <Widget>[
-          Text(
-            title,
-            style: const TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w700,
-              color: Colors.white,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            subtitle,
-            style: TextStyle(
-              fontSize: 11.5,
-              color: Colors.white.withValues(alpha: 0.48),
-            ),
-          ),
-          const Spacer(),
-          IconButton(
-            tooltip: '关闭',
-            onPressed: () => Navigator.of(context).pop(),
-            icon: Icon(
-              Icons.close_rounded,
-              size: 20,
-              color: Colors.white.withValues(alpha: 0.72),
-            ),
-            constraints: const BoxConstraints.tightFor(width: 40, height: 40),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 /// 清晰度面板：列出当前分集的全部候选流，当前档高亮。
 /// 点选后 pop 回 [StreamInfo]，由播放页执行切档。
 class _QualitySheet extends StatelessWidget {
@@ -3674,7 +3776,7 @@ class _QualitySheet extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            _SheetHeader(
+            PlayerSheetHeader(
               title: '清晰度',
               subtitle: ordered.isEmpty ? '解析中' : '共${ordered.length}档',
             ),
@@ -3774,7 +3876,7 @@ class _SpeedSheet extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            const _SheetHeader(title: '倍速播放', subtitle: '立即生效'),
+            const PlayerSheetHeader(title: '倍速播放', subtitle: '立即生效'),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 18),
               child: GridView.builder(
