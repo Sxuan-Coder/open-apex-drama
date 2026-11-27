@@ -25,6 +25,7 @@ class FlutterWindow : public Win32Window {
                          LPARAM const lparam) noexcept override;
 
  private:
+  HWND caption_pin_ = nullptr;
   std::unique_ptr<MiniPlayerWindow> mini_player_;
 
   // The project to run.

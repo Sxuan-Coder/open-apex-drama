@@ -63,6 +63,9 @@ class Win32Window {
   // Return a RECT representing the bounds of the current client area.
   RECT GetClientArea();
 
+  // Text color for controls drawn over the native caption.
+  static COLORREF GetCaptionTextColor(HWND window);
+
  protected:
   // Processes and route salient window messages for mouse handling,
   // size change and DPI. Delegates handling of these to member overloads that

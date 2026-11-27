@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <optional>
 
+#include "caption_pin.h"
 #include "flutter/generated_plugin_registrant.h"
 
 // Host the existing Flutter view in a second HWND. Windows retains both the
@@ -172,6 +173,7 @@ bool FlutterWindow::OnCreate() {
     }
   });
   if (!SetChildContent(flutter_controller_->view()->GetNativeWindow())) return false;
+  caption_pin_ = CreateCaptionPin(GetHandle());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -186,6 +188,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  caption_pin_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -209,10 +212,19 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   switch (message) {
+    case WM_THEMECHANGED:
+    case WM_SETTINGCHANGE:
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+      if (caption_pin_) InvalidateRect(caption_pin_, nullptr, FALSE);
+      break;
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;
   }
 
-  return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+  const LRESULT result = Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+  if (message == WM_WINDOWPOSCHANGED && caption_pin_) {
+    UpdateCaptionPin(caption_pin_);
+  }
+  return result;
 }

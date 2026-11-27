@@ -303,6 +303,18 @@ void Win32Window::OnDestroy() {
   // No-op; provided for subclasses.
 }
 
+COLORREF Win32Window::GetCaptionTextColor(HWND window) {
+  HIGHCONTRAST contrast{sizeof(contrast)};
+  if (SystemParametersInfo(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+      (contrast.dwFlags & HCF_HIGHCONTRASTON)) {
+    return GetSysColor(COLOR_CAPTIONTEXT);
+  }
+  BOOL dark = FALSE;
+  DwmGetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark,
+                        sizeof(dark));
+  return dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
+}
+
 void Win32Window::UpdateTheme(HWND const window) {
   DWORD light_mode;
   DWORD light_mode_size = sizeof(light_mode);
