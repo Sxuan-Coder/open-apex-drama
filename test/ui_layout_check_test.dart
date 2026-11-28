@@ -816,7 +816,9 @@ void main() {
     backend.failOpen = false;
     await tester.tap(find.text('重试'));
     await tester.pumpAndSettle();
-    expect(backend.opens, 3);
+    // 切集复用了相邻集预解析结果：开流失败会丢弃缓存自动重试一次，再失败
+    // 才落到错误态，所以比不带预取时多一次 open。
+    expect(backend.opens, 4);
     expect(find.byTooltip('后退 10 秒'), findsOneWidget);
     expect(calls.where((call) => call.method == 'setOrientation'), isEmpty);
     backend.setVideoSize(720, 1280, rotate: 270);
@@ -850,6 +852,9 @@ void main() {
       'enter', 'drag', 'setOrientation', 'setOrientation', 'exit',
       'enter', 'exit', 'enter', 'exit',
     ]);
+    // 开播后会在后台预解析下一集（mock 有 400ms 延迟），把计时器走完，
+    // 否则页面销毁后测试会报「A Timer is still pending」。
+    await tester.pump(const Duration(milliseconds: 500));
   }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 
   testWidgets('mini player entry is Windows only', (
@@ -945,6 +950,9 @@ void main() {
     expect(backend.lastSeek, isNotNull);
     expect(backend.lastSeek!.inSeconds, greaterThan(30));
     expect(backend.lastSeek!.inSeconds, lessThanOrEqualTo(100));
+    // 开播后会在后台预解析下一集（mock 有 400ms 延迟），收尾把计时器走完，
+    // 否则测试结束时会报「A Timer is still pending」。
+    await tester.pump(const Duration(milliseconds: 500));
   }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 
   testWidgets('category filter chip tap refreshes the result grid', (
