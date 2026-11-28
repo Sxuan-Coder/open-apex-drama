@@ -91,6 +91,11 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
     expect(controlsOpacity(tester), 0);
 
+    // 片尾前会尝试截最后一帧遮挡黑屏；假播放器不支持截图时必须静默跳过。
+    player.tickPosition(const Duration(minutes: 1, seconds: 59));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+
     player.emitEpisodeEnd();
     await tester.pump();
     expect(controlsOpacity(tester), 0, reason: '片尾暂停不是用户暂停');

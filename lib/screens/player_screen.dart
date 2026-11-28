@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
@@ -195,6 +196,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// 控制层，于是每次自动连播交界都会弹出标题栏与进度条。过渡期用它压住
   /// 这次误判，并让加载圈与暂停浮标一起让位；下一集起播时结束。
   bool _autoAdvanceTransition = false;
+
+  /// 片尾最后一帧：桌面端自动连播时先盖在画面上，遮住 mpv 重新 open
+  /// 导致的瞬间黑屏；截图失败就退回原来的黑帧表现，不影响播放。
+  ui.Image? _lastFrame;
+  ui.Image? _freezeFrame;
+  bool _capturingFrame = false;
   bool _loading = true;
   bool _controlsVisible = true;
   bool _muted = false;
@@ -521,14 +528,75 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         player.state.position >= total - const Duration(milliseconds: 700);
   }
 
+  /// 是否还有下一集可连播。
+  bool get _hasNextEpisode =>
+      _episodeCount == 0 || _episode < _episodeCount;
+
   /// 片尾是否真的会连播下一集。
   ///
   /// 关闭自动播放、定时选了「播完本集」、已经是最后一集，这三种情况的
   /// 暂停仍应正常唤出控制层（用户需要操作），只有自动连播要压住。
   bool get _autoAdvanceExpected =>
-      _autoPlay &&
-      !_sleepTimer.stopsAtEpisodeEnd &&
-      (_episodeCount == 0 || _episode < _episodeCount);
+      _autoPlay && !_sleepTimer.stopsAtEpisodeEnd && _hasNextEpisode;
+
+  /// 片尾前抓一帧，供连播过渡遮挡黑帧；截图失败就维持原样。
+  void _maybeCaptureLastFrame(Duration position) {
+    if (_lastFrame != null ||
+        _capturingFrame ||
+        !_autoAdvanceExpected ||
+        _player == null) {
+      return;
+    }
+    final Duration total = _player!.state.duration;
+    if (total <= Duration.zero) {
+      return;
+    }
+    // 提前约 1.2 秒截：太晚会截到 mpv 已经清空的帧。
+    if (position < total - const Duration(milliseconds: 1200)) {
+      return;
+    }
+    unawaited(_captureLastFrame(_player!));
+  }
+
+  Future<void> _captureLastFrame(Player player) async {
+    final int episode = _episode;
+    _capturingFrame = true;
+    try {
+      final Uint8List? bytes = await player.screenshot(format: 'image/jpeg');
+      if (bytes == null || bytes.isEmpty) {
+        return;
+      }
+      final ui.Codec codec = await ui.instantiateImageCodec(bytes);
+      final ui.FrameInfo frame = await codec.getNextFrame();
+      if (!mounted || player != _player || episode != _episode) {
+        frame.image.dispose();
+        return;
+      }
+      _lastFrame?.dispose();
+      _lastFrame = frame.image;
+    } catch (error) {
+      // Android 的 mediacodec_embed 或某些流不支持截图：静默退回黑帧。
+      debugPrint('[player] 片尾截图失败: $error');
+    } finally {
+      _capturingFrame = false;
+    }
+  }
+
+  /// 新流就绪后让最后一帧多盖 200ms：等纹理真正出第一帧，避免又闪一下黑。
+  void _scheduleFreezeFrameRelease() {
+    if (_freezeFrame == null) {
+      return;
+    }
+    Future<void>.delayed(const Duration(milliseconds: 200), () {
+      if (!mounted || _freezeFrame == null) {
+        return;
+      }
+      setState(() {
+        _freezeFrame?.dispose();
+        _freezeFrame = null;
+      });
+    });
+  }
 
   /// 播放状态流回调：维护 [_playing] 并驱动控制层自动隐藏。
   void _onPlayingChanged(bool playing) {
@@ -713,6 +781,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     _controlsHideTimer?.cancel();
     _pendingControlsReveal?.cancel();
+    _lastFrame?.dispose();
+    _freezeFrame?.dispose();
     _sleepTimer.dispose();
     _swipeController.dispose();
     _clearPrefetch();
@@ -741,6 +811,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _positionSub = player.stream.position.listen((Duration position) {
       _danmakuClock.value = position;
       _persistProgress();
+      _maybeCaptureLastFrame(position);
     });
     // 弹幕层与播放状态同步：暂停即冻结，恢复后按真实进度继续。
     _danmakuPlaying.value = player.state.playing;
@@ -848,6 +919,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (player == null) {
       return;
     }
+    // 换集 / 换档后，上一集抓的片尾帧不再有效。
+    _lastFrame?.dispose();
+    _lastFrame = null;
     final int token = ++_bootToken;
     // 取到本次要播的分集之前为空：这期间若走切档失败兜底，不作废上一集的缓存。
     _resolvedEpisodeId = '';
@@ -1015,6 +1089,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           // 也不再出现；下一帧起就是正常播放的观感。
           _autoAdvanceTransition = false;
         });
+        _scheduleFreezeFrameRelease();
         // 当前集开播后再预解析下一集，避免未观看也消耗解析额度。
         unawaited(_prefetchNext());
       }
@@ -1235,6 +1310,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _controlsHideTimer?.cancel();
     _pendingControlsReveal?.cancel();
     _pendingControlsReveal = null;
+    // 用片尾截到的最后一帧盖住重新 open 的黑帧；没有截图就维持原样。
+    _freezeFrame?.dispose();
+    _freezeFrame = _lastFrame;
+    _lastFrame = null;
     setState(() => _controlsVisible = false);
     _onEpisodeCompleted();
   }
@@ -1248,6 +1327,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (revealControls) {
       _controlsVisible = true;
     }
+    _freezeFrame?.dispose();
+    _freezeFrame = null;
   }
 
   Future<void> _showSleepTimerSheet() async {
@@ -2577,6 +2658,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           child: GestureDetector(
                             behavior: HitTestBehavior.opaque,
                             onPanStart: (_) => _miniPlayerChannel.invokeMethod<void>('drag'),
+                          ),
+                        ),
+                      // 桌面自动连播：重新 open 期间先盖住最后一帧，避免黑屏。
+                      // 手机竖屏的连播走整页上滑动画，不叠这层。
+                      if (_freezeFrame != null && !_isMobilePlatform)
+                        Positioned.fill(
+                          child: ColoredBox(
+                            color: AppTokens.playerBackground,
+                            child: RawImage(
+                              image: _freezeFrame,
+                              fit: BoxFit.contain,
+                            ),
                           ),
                         ),
                       // 连播过渡期间不显示加载圈：片尾到下一集起播之间只该
