@@ -188,6 +188,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   /// 自然播完自动切集中的防重入（动画期间 completed 可能再次触发）。
   bool _autoAdvancing = false;
+
+  /// 连播过渡：本集播完到下一集真正起播之间为 true。
+  ///
+  /// 片尾 mpv 会先发 playing(false)，旧逻辑把它当成用户暂停而强制唤出
+  /// 控制层，于是每次自动连播交界都会弹出标题栏与进度条。过渡期用它压住
+  /// 这次误判，并让加载圈与暂停浮标一起让位；下一集起播时结束。
+  bool _autoAdvanceTransition = false;
   bool _loading = true;
   bool _controlsVisible = true;
   bool _muted = false;
@@ -293,6 +300,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   static const Duration _controlsAutoHideDelay = Duration(seconds: 3);
   static const Duration _mobileControlsAutoHideDelay = Duration(seconds: 2);
   Timer? _controlsHideTimer;
+
+  /// 片尾暂停的「补弹」计时：media_kit 播完先发 playing(false)，此刻还不能
+  /// 确定是播完还是用户暂停。先压 350ms，completed 一到就取消；真不是播完
+  /// （例如拖到片尾后手动暂停）再把控制层放出来。
+  Timer? _pendingControlsReveal;
   bool _playing = false;
 
   /// 控制层锁定（防误触）：锁定后所有画面手势与控制层全部禁用，
@@ -366,6 +378,23 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       if (mounted && _playing && !_scrubbing &&
           _miniSeekPreview == null && _controlsVisible) {
         setState(() => _controlsVisible = false);
+      }
+    });
+  }
+
+  /// 片尾暂停的补弹：先压一小会儿，等 completed 确认是否进入自动连播。
+  ///
+  /// 若 350ms 内没有进入连播过渡（用户拖到片尾后暂停），说明这次暂停不会
+  /// 切集，控制层需要正常出现，否则用户没有入口继续操作。
+  void _scheduleControlsReveal() {
+    _pendingControlsReveal?.cancel();
+    _pendingControlsReveal = Timer(const Duration(milliseconds: 350), () {
+      _pendingControlsReveal = null;
+      if (!mounted || _playing || _autoAdvanceTransition) {
+        return;
+      }
+      if (!_controlsVisible) {
+        setState(() => _controlsVisible = true);
       }
     });
   }
@@ -474,17 +503,58 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     });
   }
 
+  /// 本集是否已经播到片尾。
+  ///
+  /// media_kit 播完时**先**发 playing(false)、**后**发 completed(true)
+  ///（见 test/support/fake_platform_player.dart），所以不能只看
+  /// [PlayerState.completed]；位置已经贴到片尾同样按播完处理。
+  bool get _atEpisodeEnd {
+    final Player? player = _player;
+    if (player == null) {
+      return false;
+    }
+    if (player.state.completed) {
+      return true;
+    }
+    final Duration total = player.state.duration;
+    return total > Duration.zero &&
+        player.state.position >= total - const Duration(milliseconds: 700);
+  }
+
+  /// 片尾是否真的会连播下一集。
+  ///
+  /// 关闭自动播放、定时选了「播完本集」、已经是最后一集，这三种情况的
+  /// 暂停仍应正常唤出控制层（用户需要操作），只有自动连播要压住。
+  bool get _autoAdvanceExpected =>
+      _autoPlay &&
+      !_sleepTimer.stopsAtEpisodeEnd &&
+      (_episodeCount == 0 || _episode < _episodeCount);
+
   /// 播放状态流回调：维护 [_playing] 并驱动控制层自动隐藏。
   void _onPlayingChanged(bool playing) {
     final bool wasPlaying = _playing;
     _playing = playing;
     if (playing) {
+      _pendingControlsReveal?.cancel();
+      _pendingControlsReveal = null;
+      // 开流还没结束（_loading）时先留在过渡态：等 [_boot] 真正就绪再收尾，
+      // 否则起播瞬间会闪一下加载圈。
+      if (!_loading) {
+        _autoAdvanceTransition = false;
+      }
       _scheduleControlsHide();
     } else {
-      // 暂停时常显，方便操作面板。
+      // 暂停时常显，方便操作面板；但片尾自动连播不是用户暂停，控制层
+      // 必须保持收起，否则每次切集都会弹出标题栏和进度条。
       _controlsHideTimer?.cancel();
-      if (mounted && !_controlsVisible) {
-        setState(() => _controlsVisible = true);
+      if (_autoAdvanceExpected && _atEpisodeEnd) {
+        _scheduleControlsReveal();
+      } else {
+        _pendingControlsReveal?.cancel();
+        _pendingControlsReveal = null;
+        if (mounted && !_controlsVisible) {
+          setState(() => _controlsVisible = true);
+        }
       }
     }
     // 播放/暂停切换必须重建：中央暂停浮标的透明度读的是 [_playing]，
@@ -642,6 +712,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     } catch (_) {}
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     _controlsHideTimer?.cancel();
+    _pendingControlsReveal?.cancel();
     _sleepTimer.dispose();
     _swipeController.dispose();
     _clearPrefetch();
@@ -860,6 +931,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           setState(() {
             _loading = false;
             _error = '该集视频编码（bytevc2）暂不支持播放，请稍后重试';
+            _endAutoAdvanceTransition(revealControls: true);
           });
         }
         return;
@@ -937,7 +1009,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       unawaited(_loadDanmaku(episode.id));
 
       if (mounted) {
-        setState(() => _loading = false);
+        setState(() {
+          _loading = false;
+          // 自动连播的过渡到「新流已就绪」为止：控制层保持收起，加载圈
+          // 也不再出现；下一帧起就是正常播放的观感。
+          _autoAdvanceTransition = false;
+        });
         // 当前集开播后再预解析下一集，避免未观看也消耗解析额度。
         unawaited(_prefetchNext());
       }
@@ -963,6 +1040,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         setState(() {
           _loading = false;
           _error = error.userMessage;
+          _endAutoAdvanceTransition(revealControls: true);
         });
       }
     } catch (error) {
@@ -985,6 +1063,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         setState(() {
           _loading = false;
           _error = '播放失败，请重试';
+          _endAutoAdvanceTransition(revealControls: true);
         });
       }
     }
@@ -1137,9 +1216,37 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       case EpisodeEndAction.closeForSleepTimer:
         _closeForSleepTimer();
       case EpisodeEndAction.advance:
-        _onEpisodeCompleted();
+        // 最后一集没有下一集可切，停在片尾并按普通暂停处理。
+        if (_autoAdvanceExpected) {
+          _beginAutoAdvance();
+        }
       case EpisodeEndAction.none:
         break;
+    }
+  }
+
+  /// 进入自动连播过渡：立即收起控制层且不做淡出。
+  ///
+  /// 若只靠上面 [_onPlayingChanged] 的压制，控制层本来已经收起时没问题；
+  /// 但用户刚暂停/暂停中播完时它是可见的，这里要让它立刻消失，避免旧标题、
+  /// 旧进度条与下一集集号在同一帧里闪一下。
+  void _beginAutoAdvance() {
+    _autoAdvanceTransition = true;
+    _controlsHideTimer?.cancel();
+    _pendingControlsReveal?.cancel();
+    _pendingControlsReveal = null;
+    setState(() => _controlsVisible = false);
+    _onEpisodeCompleted();
+  }
+
+  /// 结束连播过渡。[revealControls] 用于启动失败：错误页不能没有控制栏。
+  void _endAutoAdvanceTransition({bool revealControls = false}) {
+    if (!_autoAdvanceTransition) {
+      return;
+    }
+    _autoAdvanceTransition = false;
+    if (revealControls) {
+      _controlsVisible = true;
     }
   }
 
@@ -1854,8 +1961,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   ///
   /// Android 真机上第二路 `mediacodec_embed` 会抢占视频输出（有声无画），
   /// 而真正稀缺的是解析额度——缓存 bundle 已足够让切集免二次解析。
+  ///
+  /// 所有平台都预取：这里既不建播放器也不碰视频输出，不存在双播放器的
+  /// Surface 冲突；Windows 之前被 `_isMobilePlatform` 挡掉，导致每次自动
+  /// 连播都要现场取址（一次网络往返 + 可能的 1s/3s/6s 重试），换集明显卡顿。
   Future<void> _prefetchNext() async {
-    if (!_kEnablePrefetch || !_isMobilePlatform || _isWideLayout) {
+    if (!_kEnablePrefetch) {
       return;
     }
     final int next = nextPreloadEpisode(_episode, _episodeCount);
@@ -1882,7 +1993,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       final PlaybackBundle bundle = await ref
           .read(playbackRepositoryProvider)
           .resolve(info.id);
-      if (!mounted || !_isMobilePlatform || _isWideLayout) {
+      if (!mounted) {
         return;
       }
       if (_episode != next - 1 || seriesId != _seriesId) {
@@ -2237,8 +2348,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           )
         : null;
     final Widget? miniPlayerControls = _miniPlayer ? _buildMiniPlayerControls() : null;
+    // 连播过渡期间控制层必须完全收起（含小窗的加载/错误兜底）。
     final bool showControls =
-        _controlsVisible || (_miniPlayer && (_loading || _error != null));
+        !_autoAdvanceTransition &&
+        (_controlsVisible || (_miniPlayer && (_loading || _error != null)));
 
     return CallbackShortcuts(
       bindings: _shortcutBindings,
@@ -2466,12 +2579,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                             onPanStart: (_) => _miniPlayerChannel.invokeMethod<void>('drag'),
                           ),
                         ),
-                      if (_loading) const _CenteredStatus(loading: true),
+                      // 连播过渡期间不显示加载圈：片尾到下一集起播之间只该
+                      // 保留画面，不该出现"正在加载一集"的观感。
+                      if (_loading && !_autoAdvanceTransition)
+                        const _CenteredStatus(loading: true),
                       if (_error != null)
                         _CenteredStatus(message: _error!, onRetry: _boot),
                       AnimatedOpacity(
+                        key: const Key('player-controls'),
                         opacity: showControls ? 1 : 0,
-                        duration: const Duration(milliseconds: 160),
+                        // 过渡期不走淡出：旧标题/进度条一帧都不该露出来。
+                        duration: _autoAdvanceTransition
+                            ? Duration.zero
+                            : const Duration(milliseconds: 160),
                         child: IgnorePointer(
                           ignoring: !showControls,
                           child: miniPlayerControls ?? DecoratedBox(
@@ -2658,7 +2778,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                                 mobile: _isMobilePlatform,
                                 hasPlayer: _player != null,
                                 playing: _playing,
-                                loading: _loading,
+                                // 连播过渡不算暂停，别闪一下中央播放图标。
+                                loading: _loading || _autoAdvanceTransition,
                                 hasError: _error != null,
                               )
                               ? 1
