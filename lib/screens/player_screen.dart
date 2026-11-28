@@ -150,6 +150,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _prefetching = false;
   bool _prefetchQueued = false;
 
+  /// 桌面端无缝连播：下一集预加载播放器（静音、暂停在首帧）。
+  ///
+  /// 只在这台机器是桌面、且没有注入假播放器（测试 / 嵌入）时启用：
+  /// Android 的 `mediacodec_embed` 不能共存两路 Surface，桌面 texture
+  /// 管线则可以，切集时直接换纹理，不用重新 open 当前播放器。
+  Player? _preloadPlayer;
+  VideoController? _preloadController;
+  int? _preloadEpisode;
+  PlaybackBundle? _preloadBundle;
+  StreamInfo? _preloadStream;
+  bool _preloading = false;
+
+  /// 预加载失败过的集号：失败后在当前集内不再反复重试（每 20 秒会重新
+  /// 触发一次位置检查，没有这个标记会反复建播放器 / 请求解析）。
+  int? _preloadFailedEpisode;
+
   /// 播放进度落盘节流间隔（毫秒）：播放中每 5 秒最多写一次。
   static const int _progressWriteIntervalMs = 5000;
   int _lastProgressWriteAt = 0;
@@ -352,6 +368,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       (defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS) &&
       MediaQuery.sizeOf(context).shortestSide < 600;
+
+  /// 是否启用第二路预加载实现无缝连播。
+  ///
+  /// 仅桌面且未注入假播放器：widget 测试没有原生解码器，注入的假播放器
+  /// 也不该真的多开一路；Android 的 mediacodec_embed 无法共存两路 Surface。
+  bool get _seamlessPreloadEnabled =>
+      !_isMobilePlatform && widget.environment.platformPlayerFactory == null;
 
   /// 锁定入口是否可用：仅移动端横屏（全屏请求或物理旋转任一成立）。
   /// 竖屏信息流没有锁定诉求，桌面无触摸误触问题，均不提供。
@@ -671,12 +694,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final Player player = bundle.player;
     _player = player;
     _controller = bundle.controller;
-    _completedSub = player.stream.completed.listen((bool done) {
-      // 开流中 / 切档中不重复响应，避免 completed 连发时连跳两集。
-      if (done && mounted && !_loading && !_switchingQuality) {
-        _onStreamCompleted();
-      }
-    });
+    _listenCompleted(player);
     _observeProgress(player);
     // 音轨诊断：mpv 的音频输出/解码报错只会出现在日志里，静默失败时
     // 表现为「有画面没声音」，因此在 debug 下转发出来便于排查。
@@ -786,6 +804,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _sleepTimer.dispose();
     _swipeController.dispose();
     _clearPrefetch();
+    _disposePreload();
     _completedSub?.cancel();
     _positionSub?.cancel();
     _playingSub?.cancel();
@@ -802,6 +821,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     super.dispose();
   }
 
+  /// 挂「本集播完」监听；切集 / 提升预加载播放器时复用。
+  void _listenCompleted(Player player) {
+    _completedSub?.cancel();
+    _completedSub = player.stream.completed.listen((bool done) {
+      // 开流中 / 切档中不重复响应，避免 completed 连发时连跳两集。
+      if (done && mounted && !_loading && !_switchingQuality) {
+        _onStreamCompleted();
+      }
+    });
+  }
+
   /// 监听 position 流做节流写入（每 5 秒一次），并捕获暂停节点。
   ///
   /// 切清晰度销毁重建 Player 时由 [_buildPlayer] 重新挂载，旧订阅先取消。
@@ -812,6 +842,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _danmakuClock.value = position;
       _persistProgress();
       _maybeCaptureLastFrame(position);
+      _maybePreloadNext(position);
     });
     // 弹幕层与播放状态同步：暂停即冻结，恢复后按真实进度继续。
     _danmakuPlaying.value = player.state.playing;
@@ -919,9 +950,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (player == null) {
       return;
     }
-    // 换集 / 换档后，上一集抓的片尾帧不再有效。
+    // 换集 / 换档后，上一集抓的片尾帧与预加载失败标记都不再有效。
     _lastFrame?.dispose();
     _lastFrame = null;
+    _preloadFailedEpisode = null;
     final int token = ++_bootToken;
     // 取到本次要播的分集之前为空：这期间若走切档失败兜底，不作废上一集的缓存。
     _resolvedEpisodeId = '';
@@ -1194,6 +1226,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     final Duration resume = player.state.position;
     final bool wasPlaying = player.state.playing;
+    // 换清晰度会重建当前播放器，预加载的下一集也要作废重来。
+    _disposePreload();
     // 换流前落盘当前进度；重建后节流写入会在新流上继续。
     _persistProgress(force: true);
     _switchingQuality = true;
@@ -1310,6 +1344,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _controlsHideTimer?.cancel();
     _pendingControlsReveal?.cancel();
     _pendingControlsReveal = null;
+    // 预加载播放器已经出好首帧：直接换纹理，既没有黑帧也没有冻结帧。
+    if (_preloadReady) {
+      _freezeFrame?.dispose();
+      _freezeFrame = null;
+      _lastFrame?.dispose();
+      _lastFrame = null;
+      setState(() => _controlsVisible = false);
+      _promotePreload();
+      return;
+    }
     // 用片尾截到的最后一帧盖住重新 open 的黑帧；没有截图就维持原样。
     _freezeFrame?.dispose();
     _freezeFrame = _lastFrame;
@@ -1458,6 +1502,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (_episodeCount > 0 && next > _episodeCount) {
       return;
     }
+    // 下一集已经预加载好：直接换纹理，零黑帧。
+    if (_preloadReady) {
+      _promotePreload();
+      return;
+    }
+    _disposePreload();
     // 切集前把当前集的最终进度落盘（播完时 progress==duration，
     // 该集会自然移出「继续观看」但保留在历史里）。
     _persistProgress(force: true);
@@ -1473,6 +1523,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (previous < 1) {
       return;
     }
+    _disposePreload();
     _persistProgress(force: true);
     setState(() => _episode = previous);
     _boot();
@@ -1488,6 +1539,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _windowBusy = true;
     final bool entering = !_miniPlayer;
     try {
+      // 小窗只展示当前一路视频，预加载的下一集先释放。
+      if (entering) _disposePreload();
       // 先收起完整控制栏，避免缩窗时短暂溢出；恢复时等窗口放大再显示。
       if (entering) setState(() => _miniPlayer = true);
       await _miniPlayerChannel.invokeMethod<void>(
@@ -1737,8 +1790,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       return;
     }
     _persistProgress(force: true);
-    // 预取的是上一季的地址，只按集号比对复用，不清掉会播错集。
+    // 预取 / 预加载的是上一季的地址，不清掉会播错集。
     _clearPrefetch();
+    _disposePreload();
     setState(() {
       _activeDrama = dramaForSeason(widget.drama, season);
       _seriesId = season.seriesId;
@@ -2097,6 +2151,200 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   void _clearPrefetch() {
     _prefetchedBundle = null;
     _prefetchedEpisode = null;
+  }
+
+  /// 临近片尾时预加载下一集：只建第二路播放器、静音暂停在首帧。
+  void _maybePreloadNext(Duration position) {
+    if (!_seamlessPreloadEnabled ||
+        _preloading ||
+        _preloadPlayer != null ||
+        _miniPlayer ||
+        _switchingQuality ||
+        _loading ||
+        _preloadFailedEpisode == _episode + 1 ||
+        !_autoAdvanceExpected) {
+      return;
+    }
+    final Player? player = _player;
+    if (player == null) {
+      return;
+    }
+    final Duration total = player.state.duration;
+    if (total <= Duration.zero) {
+      return;
+    }
+    final Duration remaining = total - position;
+    // 片尾前 8 秒开始预加载：足够走完解析（已预取则跳过）与首帧解码，
+    // 又不会让第二路解码器白白占用整集。
+    if (remaining > const Duration(seconds: 8) ||
+        remaining < const Duration(seconds: 1)) {
+      return;
+    }
+    unawaited(_preloadNext());
+  }
+
+  Future<void> _preloadNext() async {
+    final int next = _episode + 1;
+    if (_episodeCount > 0 && next > _episodeCount) {
+      return;
+    }
+    final EpisodeInfo? info = _episodeByNumber(next);
+    if (info == null) {
+      return;
+    }
+    _preloading = true;
+    Player? player;
+    try {
+      final PlaybackBundle bundle =
+          _prefetchedEpisode == next && _prefetchedBundle != null
+          ? _prefetchedBundle!
+          : await ref.read(playbackRepositoryProvider).resolve(info.id);
+      if (!mounted || !_seamlessPreloadEnabled || _episode != next - 1) {
+        return;
+      }
+      final StreamInfo chosen = _pickStream(bundle, _currentStream);
+      if (chosen.url.isEmpty) {
+        return;
+      }
+      final PlayerBundle created = widget.environment.createPlayer(
+        videoOutputConfiguration(VideoOutputMode.texture),
+      );
+      player = created.player;
+      final VideoController? controller = created.controller;
+      if (controller == null) {
+        await player.dispose();
+        return;
+      }
+      await player.setVolume(0);
+      await player.setRate(_rate);
+      if (bundle.hasKey) {
+        await (player.platform as dynamic).setProperty(
+          'demuxer-lavf-o',
+          'decryption_key=${bundle.contentKeyHex}',
+        );
+      }
+      await (player.platform as dynamic).setProperty(
+        'user-agent',
+        kCdnUserAgent,
+      );
+      await player.open(Media(chosen.url));
+      // open 会按 play 默认开始播；立刻静音暂停，只保留首帧供切换。
+      await player.setVolume(0);
+      await player.pause();
+      // 给解码器一点时间把首帧真正画进纹理。
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      if (!mounted || !_seamlessPreloadEnabled || _episode != next - 1) {
+        return;
+      }
+      _disposePreload();
+      _preloadPlayer = player;
+      _preloadController = controller;
+      _preloadEpisode = next;
+      _preloadBundle = bundle;
+      _preloadStream = chosen;
+      player = null; // 所有权交给预加载字段
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (error) {
+      // 预加载失败不打扰正片：片尾仍走原来的重新 open 路径。
+      _preloadFailedEpisode = next;
+      debugPrint('[player] 下一集预加载失败: $error');
+    } finally {
+      if (player != null) {
+        try {
+          await player.dispose();
+        } catch (_) {}
+      }
+      _preloading = false;
+    }
+  }
+
+  bool get _preloadReady =>
+      _preloadPlayer != null &&
+      _preloadController != null &&
+      _preloadEpisode == _episode + 1;
+
+  void _disposePreload() {
+    final Player? player = _preloadPlayer;
+    _preloadPlayer = null;
+    _preloadController = null;
+    _preloadEpisode = null;
+    _preloadBundle = null;
+    _preloadStream = null;
+    if (player != null) {
+      try {
+        player.stop();
+      } catch (_) {}
+      unawaited(player.dispose());
+    }
+  }
+
+  /// 把预加载播放器提升为当前集：纹理已经在画首帧，因此没有黑帧。
+  void _promotePreload() {
+    final Player? nextPlayer = _preloadPlayer;
+    final VideoController? nextController = _preloadController;
+    final int? nextEpisode = _preloadEpisode;
+    final PlaybackBundle? bundle = _preloadBundle;
+    final StreamInfo? stream = _preloadStream;
+    if (nextPlayer == null || nextController == null || nextEpisode == null) {
+      return;
+    }
+    final EpisodeInfo? info = _episodeByNumber(nextEpisode);
+    _persistProgress(force: true);
+    final Player? oldPlayer = _player;
+    _completedSub?.cancel();
+    _completedSub = null;
+    _positionSub?.cancel();
+    _positionSub = null;
+    _playingSub?.cancel();
+    _playingSub = null;
+    _videoParamsSub?.cancel();
+    _videoParamsSub = null;
+    _cachedOpenErrorSub?.cancel();
+    _cachedOpenErrorSub = null;
+    _preloadPlayer = null;
+    _preloadController = null;
+    _preloadEpisode = null;
+    _preloadBundle = null;
+    _preloadStream = null;
+    _lastFrame?.dispose();
+    _lastFrame = null;
+    _freezeFrame?.dispose();
+    _freezeFrame = null;
+    setState(() {
+      _player = nextPlayer;
+      _controller = nextController;
+      _episode = nextEpisode;
+      _bundle = bundle;
+      _currentStream = stream;
+      _resolvedEpisodeId = info?.id ?? '';
+      _preferredDefinition = stream?.definition ?? _preferredDefinition;
+      _loading = false;
+      _error = null;
+      _autoAdvanceTransition = false;
+      _controlsVisible = false;
+    });
+    _listenCompleted(nextPlayer);
+    _observeProgress(nextPlayer);
+    nextPlayer.setVolume(_muted ? 0 : _volume * 100);
+    nextPlayer.setRate(_rate);
+    nextPlayer.play();
+    if (info != null) {
+      unawaited(_loadDanmaku(info.id));
+    }
+    // 旧播放器已经停在片尾；稍等一帧再释放，避免切纹理时抢音频设备。
+    if (oldPlayer != null) {
+      Future<void>.delayed(const Duration(milliseconds: 300), () async {
+        try {
+          await oldPlayer.stop();
+        } catch (_) {}
+        try {
+          await oldPlayer.dispose();
+        } catch (_) {}
+      });
+    }
+    unawaited(_prefetchNext());
   }
 
   /// 单步 seek（桌面 ←/→ 快捷键用）：在当前位置上叠加
@@ -2575,6 +2823,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                       // PlatformView，放进 Positioned/Transform/嵌套 Stack
                       // 都会导致整块黑屏。只有拖动位移非 0 时才切到嵌套层。
                       if (_swipeDy == 0) ...<Widget>[
+                        // 下一集预加载画面：先藏在当前画面后面，纹理持续
+                        // 出帧；切集时把它提升为主画面，直接换 key 显示。
+                        if (_preloadController != null && !_isMobilePlatform)
+                          IgnorePointer(
+                            child: Center(
+                              child: Video(
+                                key: ValueKey<VideoController>(
+                                  _preloadController!,
+                                ),
+                                controller: _preloadController!,
+                                controls: NoVideoControls,
+                                fit: BoxFit.contain,
+                              ),
+                            ),
+                          ),
                         if (_controller == null ||
                             (_currentStream == null &&
                                 (_loading || _error != null)))
@@ -2586,6 +2849,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           IgnorePointer(
                             child: Center(
                               child: Video(
+                                key: ValueKey<VideoController>(_controller!),
                                 controller: _controller!,
                                 controls: NoVideoControls,
                                 fit: BoxFit.contain,
